@@ -14,6 +14,11 @@ from comfy.ldm.lightricks.symmetric_patchifier import latent_to_pixel_coords
 from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
 
+def default(x, y):
+    if x is not None:
+        return x
+    return y
+
 SUPPORTED_MODELS_COEFFICIENTS = {
     "flux": [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01],
     "flux-kontext": [-1.04655119e+03, 3.12563399e+02, -1.69500694e+01, 4.10995971e-01, 3.74537863e-02],
@@ -23,6 +28,7 @@ SUPPORTED_MODELS_COEFFICIENTS = {
     "hidream_i1_full": [-3.13605009e+04, -7.12425503e+02, 4.91363285e+01, 8.26515490e+00, 1.08053901e-01],
     "hidream_i1_dev": [1.39997273, -4.30130469, 5.01534416, -2.20504164, 0.93942874],
     "hidream_i1_fast": [2.26509623, -6.88864563, 7.61123826, -3.10849353, 0.99927602],
+    "qwen-image": [-4.50000000e+02, 2.80000000e+02, -4.50000000e+01, 3.20000000e+00, -2.00000000e-02],
     "wan2.1_t2v_1.3B": [2.39676752e+03, -1.31110545e+03, 2.01331979e+02, -8.29855975e+00, 1.37887774e-01],
     "wan2.1_t2v_14B": [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404],
     "wan2.1_i2v_480p_14B": [-3.02331670e+02, 2.23948934e+02, -5.25463970e+01, 5.87348440e+00, -2.01973289e-01],
@@ -839,13 +845,142 @@ def teacache_wanmodel_forward(
         x = self.unpatchify(x, grid_sizes)
         return x
 
+def teacache_qwen_image_forward(
+        self,
+        x,
+        timesteps,
+        context,
+        attention_mask=None,
+        guidance: torch.Tensor = None,
+        transformer_options={},
+        **kwargs
+    ):
+        rel_l1_thresh = transformer_options.get("rel_l1_thresh")
+        coefficients = transformer_options.get("coefficients")
+        enable_teacache = transformer_options.get("enable_teacache", True)
+        cache_device = transformer_options.get("cache_device")
+
+        timestep = timesteps
+        encoder_hidden_states = context
+        encoder_hidden_states_mask = attention_mask
+
+        image_rotary_emb = self.pos_embeds(x, context)
+
+        hidden_states = comfy.ldm.common_dit.pad_to_patch_size(x, (1, self.patch_size, self.patch_size))
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(orig_shape[0], orig_shape[1], orig_shape[-2] // 2, 2, orig_shape[-1] // 2, 2)
+        hidden_states = hidden_states.permute(0, 2, 4, 1, 3, 5)
+        hidden_states = hidden_states.reshape(orig_shape[0], (orig_shape[-2] // 2) * (orig_shape[-1] // 2), orig_shape[1] * 4)
+
+        hidden_states = self.img_in(hidden_states)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states)
+        )
+
+        # TeaCache logic - use first transformer block's input as modulated input for change detection
+        # This is similar to how FLUX uses the first double_block's modulated input
+        if len(self.transformer_blocks) > 0:
+            # Get the first block to calculate modulated input
+            first_block = self.transformer_blocks[0]
+            # Use the processed hidden_states as modulated input (after img_in transformation)
+            modulated_inp = hidden_states.to(cache_device)
+        else:
+            modulated_inp = hidden_states.to(cache_device)
+        
+        # CFG-aware caching - maintain separate states for positive and negative prompts
+        # Detect CFG mode by checking encoder_hidden_states sequence length
+        is_positive_prompt = encoder_hidden_states.shape[1] > 50  # Long sequence = positive, short = negative
+        cache_key = 'positive' if is_positive_prompt else 'negative'
+        
+        if not hasattr(self, 'teacache_states'):
+            self.teacache_states = {
+                'positive': {'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_encoder_residual': None, 'previous_hidden_residual': None},
+                'negative': {'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_encoder_residual': None, 'previous_hidden_residual': None}
+            }
+        
+        cache_state = self.teacache_states[cache_key]
+        
+        if cache_state['previous_modulated_input'] is None:
+            should_calc = True
+        else:
+            try:
+                cache_state['accumulated_rel_l1_distance'] += poly1d(coefficients, ((modulated_inp-cache_state['previous_modulated_input']).abs().mean() / cache_state['previous_modulated_input'].abs().mean())).abs()
+                if cache_state['accumulated_rel_l1_distance'] < rel_l1_thresh:
+                    should_calc = False
+                else:
+                    should_calc = True
+                    cache_state['accumulated_rel_l1_distance'] = 0
+            except:
+                should_calc = True
+                cache_state['accumulated_rel_l1_distance'] = 0
+
+        cache_state['previous_modulated_input'] = modulated_inp
+
+        if not enable_teacache:
+            should_calc = True
+
+        if not should_calc:
+            # Use CFG-aware cached residuals
+            if (cache_state['previous_encoder_residual'] is not None and 
+                cache_state['previous_hidden_residual'] is not None):
+                # Check if cached residuals have compatible shapes
+                if (cache_state['previous_encoder_residual'].shape == encoder_hidden_states.shape and 
+                    cache_state['previous_hidden_residual'].shape == hidden_states.shape):
+                    pass  # Using cached computation
+                    encoder_hidden_states += cache_state['previous_encoder_residual'].to(encoder_hidden_states.device)
+                    hidden_states += cache_state['previous_hidden_residual'].to(hidden_states.device)
+                else:
+                    # Shape mismatch, force recalculation
+                    pass  # Shape mismatch, forcing recalculation
+                    should_calc = True
+            else:
+                # No cached residuals available, force recalculation
+                pass  # No cached residuals available
+                should_calc = True
+        
+        # Process through transformer_blocks if calculation is needed
+        if should_calc:
+            # Store original states for residual calculation
+            ori_encoder_hidden_states = encoder_hidden_states.to(cache_device)
+            ori_hidden_states = hidden_states.to(cache_device)
+            
+            # Process through transformer_blocks (Qwen-Image architecture)
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            
+            # Store residuals for future use in CFG-aware cache state
+            cache_state['previous_encoder_residual'] = (encoder_hidden_states.to(cache_device) - ori_encoder_hidden_states)
+            cache_state['previous_hidden_residual'] = (hidden_states.to(cache_device) - ori_hidden_states)
+            pass  # Residuals calculated and stored
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        hidden_states = self.proj_out(hidden_states)
+
+        hidden_states = hidden_states.view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
+        hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
+        return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
+
 class TeaCache:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The diffusion model the TeaCache will be applied to."}),
-                "model_type": (["flux", "flux-kontext", "ltxv", "lumina_2", "hunyuan_video", "hidream_i1_full", "hidream_i1_dev", "hidream_i1_fast", "wan2.1_t2v_1.3B", "wan2.1_t2v_14B", "wan2.1_i2v_480p_14B", "wan2.1_i2v_720p_14B", "wan2.1_t2v_1.3B_ret_mode", "wan2.1_t2v_14B_ret_mode", "wan2.1_i2v_480p_14B_ret_mode", "wan2.1_i2v_720p_14B_ret_mode"], {"default": "flux", "tooltip": "Supported diffusion model."}),
+                "model_type": (["flux", "flux-kontext", "ltxv", "lumina_2", "hunyuan_video", "hidream_i1_full", "hidream_i1_dev", "hidream_i1_fast", "qwen-image", "wan2.1_t2v_1.3B", "wan2.1_t2v_14B", "wan2.1_i2v_480p_14B", "wan2.1_i2v_720p_14B", "wan2.1_t2v_1.3B_ret_mode", "wan2.1_t2v_14B_ret_mode", "wan2.1_i2v_480p_14B_ret_mode", "wan2.1_i2v_720p_14B_ret_mode"], {"default": "flux", "tooltip": "Supported diffusion model."}),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The start percentage of the steps that will apply TeaCache."}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of the steps that will apply TeaCache."}),
@@ -903,6 +1038,12 @@ class TeaCache:
                 diffusion_model,
                 forward_orig=teacache_hunyuanvideo_forward.__get__(diffusion_model, diffusion_model.__class__)
             )
+        elif "qwen-image" in model_type:
+            is_cfg = False
+            context = patch.multiple(
+                diffusion_model,
+                forward=teacache_qwen_image_forward.__get__(diffusion_model, diffusion_model.__class__)
+            )
         elif "wan2.1" in model_type:
             is_cfg = True
             context = patch.multiple(
@@ -939,6 +1080,8 @@ class TeaCache:
                 else:
                     if hasattr(diffusion_model, 'teacache_state'):
                         delattr(diffusion_model, 'teacache_state')
+                    if hasattr(diffusion_model, 'teacache_states'):
+                        delattr(diffusion_model, 'teacache_states')
                     if hasattr(diffusion_model, 'accumulated_rel_l1_distance'):
                         delattr(diffusion_model, 'accumulated_rel_l1_distance')
             
