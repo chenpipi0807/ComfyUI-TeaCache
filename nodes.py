@@ -864,13 +864,14 @@ def teacache_qwen_image_forward(
         encoder_hidden_states = context
         encoder_hidden_states_mask = attention_mask
 
-        image_rotary_emb = self.pos_embeds(x, context)
+        # Align with upstream Qwen-Image API: use process_img + pe_embedder
+        hidden_states, img_ids, orig_shape = self.process_img(x)
+        num_embeds = hidden_states.shape[1]
 
-        hidden_states = comfy.ldm.common_dit.pad_to_patch_size(x, (1, self.patch_size, self.patch_size))
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(orig_shape[0], orig_shape[1], orig_shape[-2] // 2, 2, orig_shape[-1] // 2, 2)
-        hidden_states = hidden_states.permute(0, 2, 4, 1, 3, 5)
-        hidden_states = hidden_states.reshape(orig_shape[0], (orig_shape[-2] // 2) * (orig_shape[-1] // 2), orig_shape[1] * 4)
+        txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size), ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size)))
+        txt_ids = torch.linspace(txt_start, txt_start + encoder_hidden_states.shape[1], steps=encoder_hidden_states.shape[1], device=x.device, dtype=x.dtype).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
 
         hidden_states = self.img_in(hidden_states)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
@@ -970,7 +971,8 @@ def teacache_qwen_image_forward(
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 
-        hidden_states = hidden_states.view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
+        # Keep the same token count as upstream forward
+        hidden_states = hidden_states[:, :num_embeds].view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
         hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
         return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
 
